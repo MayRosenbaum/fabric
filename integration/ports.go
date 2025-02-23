@@ -30,7 +30,6 @@ const (
 	GatewayBasePort
 	GossipBasePort
 	IdemixBasePort
-	KafkaBasePort
 	LedgerPort
 	LifecyclePort
 	MSPPort
