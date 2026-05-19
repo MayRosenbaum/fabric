@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
-	"time"
 )
 
 func parseServers(servers string) []string {
@@ -34,7 +32,6 @@ func main() {
 	var expectedTxs int
 	var outputDir string
 	var pullFrom int
-	var receiveFirstDelay time.Duration
 
 	flag.StringVar(&servers, "servers", "127.0.0.1:7050", "Comma-separated list of orderer addresses")
 	flag.StringVar(&channelID, "channelID", "mychannel", "The channel ID to broadcast to and deliver from")
@@ -44,7 +41,6 @@ func main() {
 	flag.IntVar(&expectedTxs, "expectedTxs", -1, "The expected number of transactions to receive before stopping")
 	flag.StringVar(&outputDir, "output", ".", "The output directory in which to place statistics.csv")
 	flag.IntVar(&pullFrom, "pullFrom", 1, "The 1-based orderer index to pull blocks from")
-	flag.DurationVar(&receiveFirstDelay, "receiveFirstDelay", 2*time.Second, "How long to wait after starting receive before starting load")
 	flag.Parse()
 
 	serverList := parseServers(servers)
@@ -57,6 +53,12 @@ func main() {
 		expectedTxs = transactions
 	}
 
+	signer, err := loadLocalSigner()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
 	cfg := Config{
 		Servers:      serverList,
 		ChannelID:    channelID,
@@ -66,33 +68,32 @@ func main() {
 		ExpectedTxs:  expectedTxs,
 		OutputDir:    outputDir,
 		PullFrom:     pullFrom,
+		Signer:       signer,
 	}
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, 2)
+	loadErrCh := make(chan error, 1)
+	receiveErrCh := make(chan error, 1)
 
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
-		errCh <- Receive(cfg)
+		loadErrCh <- Load(cfg)
 	}()
 
-	time.Sleep(receiveFirstDelay)
-
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
-		errCh <- Load(cfg)
+		receiveErrCh <- Receive(cfg)
 	}()
 
-	wg.Wait()
-	close(errCh)
+	// First, wait for Load.
+	if err := <-loadErrCh; err != nil {
+		fmt.Fprintln(os.Stderr, "Load failed:", err)
+		os.Exit(1)
+	}
 
-	for err := range errCh {
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
+	fmt.Println("Load finished successfully, waiting for receiver...")
+
+	// Then wait for Receive to finish expectedTxs.
+	if err := <-receiveErrCh; err != nil {
+		fmt.Fprintln(os.Stderr, "Receive failed:", err)
+		os.Exit(1)
 	}
 
 	fmt.Printf("Completed successfully. Statistics written to %s/statistics.csv\n", outputDir)

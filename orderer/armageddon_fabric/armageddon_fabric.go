@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/csv"
 	"fmt"
 	"math"
@@ -35,6 +36,7 @@ type Config struct {
 	ExpectedTxs  int
 	OutputDir    string
 	PullFrom     int
+	Signer       identity.SignerSerializer
 }
 
 type StreamInfo struct {
@@ -102,6 +104,7 @@ func (streamInfo *StreamInfo) TryReconnect() {
 					if delay > streamInfo.maxRetryDelay {
 						delay = streamInfo.maxRetryDelay
 					}
+					fmt.Printf("connection to the orderer did not succeeded, goint to try again")
 					continue
 				}
 
@@ -151,10 +154,12 @@ func (c *BroadcastTxClient) SendTxToAllOrderers(envelope *cb.Envelope) {
 		if !streamInfo.IsBroken() {
 			err := streamInfo.stream.Send(envelope)
 			if err != nil {
+				fmt.Printf("Send failed to %s: %v\n", streamInfo.endpoint, err)
 				streamInfo.SetIsBroken(true)
 				streamInfo.TryReconnect()
 			} else {
 				atomic.AddUint64(&streamInfo.sentTxs, 1)
+				fmt.Printf("Sent tx to %s", streamInfo.endpoint)
 			}
 		}
 	}
@@ -195,12 +200,14 @@ func receiveResponseFromOrderer(streamInfo *StreamInfo) {
 		case <-streamInfo.stopChan:
 			return
 		default:
-			_, err := streamInfo.stream.Recv()
+			resp, err := streamInfo.stream.Recv()
 			if err != nil {
+				fmt.Printf("Broadcast ack recv error from orderer %s: %v\n", streamInfo.endpoint, err)
 				streamInfo.SetIsBroken(true)
 				streamInfo.TryReconnect()
 				return
 			}
+			fmt.Printf("Broadcast ack from orderer %s: status=%s info=%s\n", streamInfo.endpoint, resp.Status.String(), resp.Info)
 		}
 	}
 }
@@ -362,22 +369,22 @@ func Load(cfg Config) error {
 		return fmt.Errorf("the required tx size: %d is less than the minimum size: %d", cfg.TxSize, txMinimumSize)
 	}
 
-	signer, err := loadLocalSigner()
-	if err != nil {
-		return err
+	if cfg.Signer == nil {
+		return fmt.Errorf("signer is not initialized")
 	}
 
 	convertedRates := make([]int, len(rates))
 	for i := 0; i < len(rates); i++ {
-		convertedRates[i], err = strconv.Atoi(rates[i])
+		convertedRate, err := strconv.Atoi(rates[i])
 		if err != nil {
 			return fmt.Errorf("rate is not valid: %w", err)
 		}
+		convertedRates[i] = convertedRate
 	}
 
 	for _, convertedRate := range convertedRates {
 		start := time.Now()
-		err := sendTxsToAllAvailableOrderers(cfg.Servers, cfg.ChannelID, signer, cfg.Transactions, convertedRate, cfg.TxSize)
+		err := sendTxsToAllAvailableOrderers(cfg.Servers, cfg.ChannelID, cfg.Signer, cfg.Transactions, convertedRate, cfg.TxSize)
 		if err != nil {
 			return err
 		}
@@ -439,12 +446,11 @@ func Receive(cfg Config) error {
 		return fmt.Errorf("pullFrom %d is out of range, number of orderers: %d", cfg.PullFrom, len(cfg.Servers))
 	}
 
-	signer, err := loadLocalSigner()
-	if err != nil {
-		return err
+	if cfg.Signer == nil {
+		return fmt.Errorf("signer is not initialized")
 	}
 
-	return pullBlocksFromOrdererAndCollectStatistics(cfg.Servers, cfg.ChannelID, signer, cfg.PullFrom, cfg.OutputDir, cfg.ExpectedTxs)
+	return pullBlocksFromOrdererAndCollectStatistics(cfg.Servers, cfg.ChannelID, cfg.Signer, cfg.PullFrom, cfg.OutputDir, cfg.ExpectedTxs)
 }
 
 func pullBlocksFromOrdererAndCollectStatistics(ordererEndpoints []string, channelID string, signer identity.SignerSerializer, pullFrom int, receiveOutputDir string, expectedNumOfTxs int) error {
@@ -577,23 +583,32 @@ func calculateDelayOfTx(data []byte, acceptedTime time.Time) time.Duration {
 func pullBlock(stream ab.AtomicBroadcast_DeliverClient, endpointToPullFrom string, conn *grpc.ClientConn) (*cb.Block, error) {
 	resp, err := stream.Recv()
 	if err != nil {
-		return nil, fmt.Errorf("failed to receive a deliver response from %s", endpointToPullFrom)
+		return nil, fmt.Errorf("failed to receive a deliver response from %s: %w", endpointToPullFrom, err)
 	}
 
-	block := resp.GetBlock()
-	if block == nil {
-		_ = stream.CloseSend()
-		_ = conn.Close()
-		return nil, fmt.Errorf("received a non block message from %s: %v", endpointToPullFrom, resp)
-	}
+	switch t := resp.Type.(type) {
+	case *ab.DeliverResponse_Block:
+		block := t.Block
+		if block == nil {
+			_ = stream.CloseSend()
+			_ = conn.Close()
+			return nil, fmt.Errorf("received nil block from %s", endpointToPullFrom)
+		}
 
-	if block.Data == nil || len(block.Data.Data) == 0 {
-		_ = stream.CloseSend()
-		_ = conn.Close()
-		return nil, fmt.Errorf("received empty block from %s", endpointToPullFrom)
-	}
+		fmt.Printf("Deliver block from %s: number=%d txs=%d\n", endpointToPullFrom, block.Header.Number, len(block.Data.Data))
 
-	return block, nil
+		if block.Data == nil || len(block.Data.Data) == 0 {
+			_ = stream.CloseSend()
+			_ = conn.Close()
+			return nil, fmt.Errorf("received empty block from %s", endpointToPullFrom)
+		}
+
+		return block, nil
+	case *ab.DeliverResponse_Status:
+		return nil, fmt.Errorf("received deliver status from %s: status=%s", endpointToPullFrom, t.Status.String())
+	default:
+		return nil, fmt.Errorf("received unexpected deliver response from %s: %T", endpointToPullFrom, resp.Type)
+	}
 }
 
 func createDeliverEnvelope(channelID string, signer identity.SignerSerializer) (*cb.Envelope, error) {
@@ -612,46 +627,136 @@ func createDeliverEnvelope(channelID string, signer identity.SignerSerializer) (
 	)
 }
 
-func createFabricBroadcastEnvelope(index int, txSize int, sessionNumber []byte, channelID string, signer identity.SignerSerializer) (*cb.Envelope, error) {
-	payload := make([]byte, txSize)
-	copy(payload[:16], sessionNumber)
+func createFabricBroadcastEnvelope(index int, targetEnvSize int, sessionNumber []byte, channelID string, signer identity.SignerSerializer) (*cb.Envelope, error) {
+	// payload := make([]byte, txSize)
+	// copy(payload[:16], sessionNumber)
 
-	timestamp := time.Now().UnixNano()
-	for i := 0; i < 8; i++ {
-		payload[16+i] = byte(timestamp >> (8 * i))
-		payload[24+i] = byte(index >> (8 * i))
+	// timestamp := time.Now().UnixNano()
+	// for i := 0; i < 8; i++ {
+	// 	payload[16+i] = byte(timestamp >> (8 * i))
+	// 	payload[24+i] = byte(index >> (8 * i))
+	// }
+
+	// return protoutil.CreateSignedEnvelope(
+	// 	cb.HeaderType_MESSAGE,
+	// 	channelID,
+	// 	signer,
+	// 	&cb.Envelope{Payload: payload},
+	// 	0,
+	// 	0,
+	// )
+	const metaSize = 16 + 8 + 8 // session + timestamp + index
+
+	if len(sessionNumber) > 16 {
+		return nil, fmt.Errorf("sessionNumber must be <= 16 bytes")
+	}
+	if targetEnvSize < metaSize {
+		return nil, fmt.Errorf("targetEnvSize too small")
 	}
 
-	return protoutil.CreateSignedEnvelope(
-		cb.HeaderType_ENDORSER_TRANSACTION,
-		channelID,
-		signer,
-		&cb.Envelope{Payload: payload},
-		0,
-		0,
-	)
-}
+	build := func(payloadSize int) (*cb.Envelope, error) {
+		payload := make([]byte, payloadSize)
 
-func extractPayloadBytes(env *cb.Envelope) ([]byte, error) {
-	payload := &cb.Payload{}
-	payload, err := protoutil.UnmarshalPayload(env.Payload)
+		copy(payload[:16], sessionNumber)
+
+		timestamp := time.Now().UnixNano()
+		binary.LittleEndian.PutUint64(payload[16:24], uint64(timestamp))
+		binary.LittleEndian.PutUint64(payload[24:32], uint64(index))
+
+		return protoutil.CreateSignedEnvelope(
+			cb.HeaderType_ENDORSER_TRANSACTION,
+			channelID,
+			signer,
+			&cb.Envelope{Payload: payload},
+			0,
+			0,
+		)
+	}
+
+	payloadSize := metaSize
+
+	for i := 0; i < 20; i++ {
+		env, err := build(payloadSize)
+		if err != nil {
+			return nil, err
+		}
+
+		actualSize := len(protoutil.MarshalOrPanic(env))
+		delta := targetEnvSize - actualSize
+
+		if delta == 0 {
+			return env, nil
+		}
+
+		payloadSize += delta
+		if payloadSize < metaSize {
+			return nil, fmt.Errorf(
+				"targetEnvSize=%d too small; current minimum envelope size=%d",
+				targetEnvSize,
+				actualSize,
+			)
+		}
+	}
+
+	env, err := build(payloadSize)
 	if err != nil {
 		return nil, err
 	}
 
-	return payload.Data, nil
+	return nil, fmt.Errorf(
+		"could not reach exact size: target=%d actual=%d payloadSize=%d",
+		targetEnvSize,
+		len(protoutil.MarshalOrPanic(env)),
+		payloadSize,
+	)
+}
+
+func extractPayloadBytes(env *cb.Envelope) ([]byte, error) {
+	// payload := &cb.Payload{}
+	// payload, err := protoutil.UnmarshalPayload(env.Payload)
+	// if err != nil {
+	// 	return nil, err
+	// }
+
+	// return payload.Data, nil
+	//####
+	// outerPayload, err := protoutil.UnmarshalPayload(env.Payload)
+	// if err != nil {
+	// 	return nil, err
+	// }
+
+	// innerPayload, err := protoutil.UnmarshalPayload(outerPayload.Data)
+	// if err != nil {
+	// 	return nil, err
+	// }
+
+	// return innerPayload.Data, nil
+	//#####
+	outerPayload, err := protoutil.UnmarshalPayload(env.Payload)
+	if err != nil {
+		return nil, err
+	}
+
+	innerEnv, err := protoutil.GetEnvelopeFromBlock(outerPayload.Data)
+	if err != nil {
+		return nil, err
+	}
+
+	return innerEnv.Payload, nil
 }
 
 func extractTimestampFromTx(data []byte) time.Time {
-	if len(data) < 24 {
-		return time.Unix(0, 0)
-	}
+	// if len(data) < 24 {
+	// 	return time.Unix(0, 0)
+	// }
 
-	var ts int64
-	for i := 0; i < 8; i++ {
-		ts |= int64(data[16+i]) << (8 * i)
-	}
-	return time.Unix(0, ts)
+	// var ts int64
+	// for i := 0; i < 8; i++ {
+	// 	ts |= int64(data[16+i]) << (8 * i)
+	// }
+	ts := int64(binary.LittleEndian.Uint64(data[16:24]))
+	sendTime := time.Unix(0, ts)
+	return sendTime
 }
 
 func reportLoadResults(transactions int, elapsed time.Duration, txSize int) {
