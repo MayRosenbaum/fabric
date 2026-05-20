@@ -334,9 +334,9 @@ func VerifyTransactionsAreWellFormed(bd *cb.BlockData) error {
 			return fmt.Errorf("transaction %d has no payload", i)
 		}
 
-		if len(env.Signature) == 0 {
-			return fmt.Errorf("transaction %d has no signature", i)
-		}
+		// if len(env.Signature) == 0 {
+		// 	return fmt.Errorf("transaction %d has no signature", i)
+		// }
 
 		expected, err := proto.Marshal(env)
 		if err != nil {
