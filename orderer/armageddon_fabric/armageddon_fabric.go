@@ -682,6 +682,7 @@ func createFabricBroadcastEnvelope(index int, targetEnvSize int, sessionNumber [
 		}
 
 		actualSize := len(protoutil.MarshalOrPanic(env))
+		fmt.Printf("actual tx size is: %v\n", actualSize)
 		delta := targetEnvSize - actualSize
 
 		if delta == 0 {

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/hyperledger/fabric/common/deliverclient/blocksprovider/fake"
 )
 
 func parseServers(servers string) []string {
@@ -53,11 +55,12 @@ func main() {
 		expectedTxs = transactions
 	}
 
-	signer, err := loadLocalSigner()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
+	//signer, err := loadLocalSigner()
+	signer := &fake.Signer{}
+	// if err != nil {
+	// 	fmt.Fprintln(os.Stderr, err)
+	// 	os.Exit(1)
+	// }
 
 	cfg := Config{
 		Servers:      serverList,
