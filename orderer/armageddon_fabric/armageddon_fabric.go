@@ -3,9 +3,13 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/csv"
 	"fmt"
+	"github.com/hyperledger/fabric-lib-go/common/flogging"
+	"google.golang.org/grpc/grpclog"
+	"io"
 	"math"
 	"os"
 	"path"
@@ -26,6 +30,13 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+func init() {
+	// set the gRPC logger to a logger that discards the log output.
+	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, io.Discard))
+}
+
+var logger = flogging.MustGetLogger("armageddon")
 
 type Config struct {
 	Servers      []string
@@ -48,7 +59,13 @@ type StreamInfo struct {
 	maxRetryDelay         time.Duration
 	endpoint              string
 	lock                  sync.Mutex
+	logger                *flogging.FabricLogger
 	sentTxs               uint64
+}
+
+func (streamInfo *StreamInfo) Report(tickInterval time.Duration) {
+	sentTxs := atomic.SwapUint64(&streamInfo.sentTxs, 0)
+	streamInfo.logger.Infof("BroadcastClient to orderer %v sent %d transactions in the last %v", streamInfo.endpoint, sentTxs, tickInterval)
 }
 
 func (streamInfo *StreamInfo) IsBroken() bool {
@@ -96,6 +113,7 @@ func (streamInfo *StreamInfo) TryReconnect() {
 		for {
 			select {
 			case <-streamInfo.stopChan:
+				streamInfo.logger.Infof("Stop TryReconnect go routine")
 				return
 			case <-ticker.C:
 				newConn, newStream, err := createBroadcastConnAndStream(streamInfo.endpoint)
@@ -104,10 +122,10 @@ func (streamInfo *StreamInfo) TryReconnect() {
 					if delay > streamInfo.maxRetryDelay {
 						delay = streamInfo.maxRetryDelay
 					}
-					fmt.Printf("connection to the orderer did not succeeded, goint to try again")
+					streamInfo.logger.Infof("Reconnection to router: %s failed, going to try again in %v", streamInfo.endpoint, delay)
 					continue
 				}
-
+				streamInfo.logger.Infof("Reconnection to router: %s succeeded", streamInfo.endpoint)
 				streamInfo.SetNewConnAndStream(newConn, newStream)
 				go receiveResponseFromOrderer(streamInfo)
 				return
@@ -143,8 +161,25 @@ func (c *BroadcastTxClient) InitStreams() error {
 			stopChan:      make(chan struct{}),
 			maxRetryDelay: 8 * time.Second,
 			endpoint:      ordererEndpoint,
+			logger:        flogging.MustGetLogger(fmt.Sprintf("BroadcastClientToOrderer%d", i+1)),
 		}
 	}
+
+	go func() {
+		tickInterval := 1 * time.Second
+		ticker := time.NewTicker(tickInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-c.stopChan:
+				return
+			case <-ticker.C:
+				for i := range c.streams {
+					c.streams[i].Report(tickInterval)
+				}
+			}
+		}
+	}()
 
 	return nil
 }
@@ -154,12 +189,11 @@ func (c *BroadcastTxClient) SendTxToAllOrderers(envelope *cb.Envelope) {
 		if !streamInfo.IsBroken() {
 			err := streamInfo.stream.Send(envelope)
 			if err != nil {
-				fmt.Printf("Send failed to %s: %v\n", streamInfo.endpoint, err)
+				streamInfo.logger.Infof("Failed to send envelope to the orderer, err: %v, mark orderer %s as broken and start reconnection", err, streamInfo.endpoint)
 				streamInfo.SetIsBroken(true)
 				streamInfo.TryReconnect()
 			} else {
 				atomic.AddUint64(&streamInfo.sentTxs, 1)
-				fmt.Printf("Sent tx to %s", streamInfo.endpoint)
 			}
 		}
 	}
@@ -198,16 +232,17 @@ func receiveResponseFromOrderer(streamInfo *StreamInfo) {
 	for {
 		select {
 		case <-streamInfo.stopChan:
+			streamInfo.logger.Infof("Stop ReceiveResponseFromOrderer go routine")
 			return
 		default:
 			resp, err := streamInfo.stream.Recv()
 			if err != nil {
-				fmt.Printf("Broadcast ack recv error from orderer %s: %v\n", streamInfo.endpoint, err)
+				streamInfo.logger.Infof("Failed to receive response from router, close receive go routine, mark router %s as broken and start reconnection, err: %v", streamInfo.endpoint, err)
 				streamInfo.SetIsBroken(true)
 				streamInfo.TryReconnect()
 				return
 			}
-			fmt.Printf("Broadcast ack from orderer %s: status=%s info=%s\n", streamInfo.endpoint, resp.Status.String(), resp.Info)
+			streamInfo.logger.Debugf("Broadcast ack from orderer %s: status=%s\n", streamInfo.endpoint, resp.Status.String())
 		}
 	}
 }
@@ -381,6 +416,7 @@ func Load(cfg Config) error {
 		}
 		convertedRates[i] = convertedRate
 	}
+	fmt.Printf("rates are: %v\n", convertedRates)
 
 	for _, convertedRate := range convertedRates {
 		start := time.Now()
@@ -498,6 +534,7 @@ func pullBlocksFromOrdererAndCollectStatistics(ordererEndpoints []string, channe
 	}()
 
 	go func() {
+
 		ticker := time.NewTicker(timeIntervalToSampleStat)
 		defer ticker.Stop()
 		for {
@@ -506,6 +543,10 @@ func pullBlocksFromOrdererAndCollectStatistics(ordererEndpoints []string, channe
 				lastStat := statisticsAggregator.ReadAndReset()
 				statisticChan <- lastStat
 			case <-stopChan:
+				// Send final statistics before exiting
+				logger.Infof("Sending final statistics batch")
+				finalStat := statisticsAggregator.ReadAndReset()
+				statisticChan <- finalStat
 				waitToFinish.Done()
 				return
 			}
@@ -513,6 +554,7 @@ func pullBlocksFromOrdererAndCollectStatistics(ordererEndpoints []string, channe
 	}()
 
 	go func() {
+		logger.Infof("starting pulling blocks from the orderer %d", pullFrom)
 		var txsTotal int
 		for {
 			block, err := pullBlock(stream, endpointToPullFrom, conn)
@@ -531,7 +573,10 @@ func pullBlocksFromOrdererAndCollectStatistics(ordererEndpoints []string, channe
 			blockChan <- blockWithTime
 			txsTotal += len(blockWithTime.block.Data.Data)
 
+			logger.Debugf("block with %d txs was pulled from the assembler, overall %d txs were received at this moment", len(blockWithTime.block.Data.Data), txsTotal)
+
 			if expectedNumOfTxs > 0 && expectedNumOfTxs <= txsTotal {
+				logger.Infof("overall %d txs were received, finished pulling", txsTotal)
 				waitToFinish.Done()
 				return
 			}
@@ -539,31 +584,39 @@ func pullBlocksFromOrdererAndCollectStatistics(ordererEndpoints []string, channe
 	}()
 
 	go func() {
+		var sumOfDelayTimes float64
+		var txs int
 		var txsTotal int
+		var sumOfTxsSize int
 		for {
 			blockWithTime := <-blockChan
-			sumOfDelayTimes := 0.0
-			sumOfTxsSize := 0
-			txs := len(blockWithTime.block.Data.Data)
+			sumOfDelayTimes = 0.0
+			sumOfTxsSize = 0
+			txs = len(blockWithTime.block.Data.Data)
 			txsTotal += txs
 
 			for j := 0; j < txs; j++ {
 				env, err := protoutil.GetEnvelopeFromBlock(blockWithTime.block.Data.Data[j])
 				if err != nil {
-					panic(err)
+					fmt.Printf("Error getting envelope from block: %v\n", err)
+					continue
 				}
 				data, err := extractPayloadBytes(env)
 				if err != nil {
-					panic(err)
+					fmt.Printf("Error extracting payload bytes: %v\n", err)
+					continue
 				}
+				logger.Debugf("tx %x was received from the assembler", data)
 
 				sumOfTxsSize += len(protoutil.MarshalOrPanic(env))
 				delay := calculateDelayOfTx(data, blockWithTime.acceptedTime)
 				sumOfDelayTimes += delay.Seconds()
 			}
+
 			statisticsAggregator.Add(txs, 1, sumOfDelayTimes, sumOfTxsSize)
 
 			if expectedNumOfTxs > 0 && expectedNumOfTxs <= txsTotal {
+				logger.Infof("%d txs were expected and overall %d were successfully received", expectedNumOfTxs, txsTotal)
 				close(stopChan)
 				waitToFinish.Done()
 				return
@@ -572,6 +625,7 @@ func pullBlocksFromOrdererAndCollectStatistics(ordererEndpoints []string, channe
 	}()
 
 	waitToFinish.Wait()
+	logger.Debugf("exit pulling blocks from the orderer %d", pullFrom)
 	return nil
 }
 
@@ -595,7 +649,7 @@ func pullBlock(stream ab.AtomicBroadcast_DeliverClient, endpointToPullFrom strin
 			return nil, fmt.Errorf("received nil block from %s", endpointToPullFrom)
 		}
 
-		fmt.Printf("Deliver block from %s: number=%d txs=%d\n", endpointToPullFrom, block.Header.Number, len(block.Data.Data))
+		logger.Debugf("Deliver block from %s: number=%d txs=%d\n", endpointToPullFrom, block.Header.Number, len(block.Data.Data))
 
 		if block.Data == nil || len(block.Data.Data) == 0 {
 			_ = stream.CloseSend()
@@ -616,35 +670,24 @@ func createDeliverEnvelope(channelID string, signer identity.SignerSerializer) (
 		cb.HeaderType_DELIVER_SEEK_INFO,
 		channelID,
 		signer,
-		&ab.SeekInfo{
-			Start:         &ab.SeekPosition{Type: &ab.SeekPosition_Oldest{Oldest: &ab.SeekOldest{}}},
-			Stop:          &ab.SeekPosition{Type: &ab.SeekPosition_Specified{Specified: &ab.SeekSpecified{Number: math.MaxUint64}}},
-			Behavior:      ab.SeekInfo_BLOCK_UNTIL_READY,
-			ErrorResponse: ab.SeekInfo_BEST_EFFORT,
-		},
+		nextSeekInfo(0),
 		0,
 		0,
 	)
 }
 
+func nextSeekInfo(startSeq uint64) *ab.SeekInfo {
+	return &ab.SeekInfo{
+		//Start: &ab.SeekPosition{Type: &ab.SeekPosition_Oldest{Oldest: &ab.SeekOldest{}}},
+		Start: &ab.SeekPosition{Type: &ab.SeekPosition_Specified{Specified: &ab.SeekSpecified{Number: startSeq}}},
+		//Stop:          &ab.SeekPosition{Type: &ab.SeekPosition_Specified{Specified: &ab.SeekSpecified{Number: math.MaxUint64}}},
+		Stop:          &ab.SeekPosition{Type: &ab.SeekPosition_Specified{Specified: &ab.SeekSpecified{Number: math.MaxUint64}}},
+		Behavior:      ab.SeekInfo_BLOCK_UNTIL_READY,
+		ErrorResponse: ab.SeekInfo_BEST_EFFORT,
+	}
+}
+
 func createFabricBroadcastEnvelope(index int, targetEnvSize int, sessionNumber []byte, channelID string, signer identity.SignerSerializer) (*cb.Envelope, error) {
-	// payload := make([]byte, txSize)
-	// copy(payload[:16], sessionNumber)
-
-	// timestamp := time.Now().UnixNano()
-	// for i := 0; i < 8; i++ {
-	// 	payload[16+i] = byte(timestamp >> (8 * i))
-	// 	payload[24+i] = byte(index >> (8 * i))
-	// }
-
-	// return protoutil.CreateSignedEnvelope(
-	// 	cb.HeaderType_MESSAGE,
-	// 	channelID,
-	// 	signer,
-	// 	&cb.Envelope{Payload: payload},
-	// 	0,
-	// 	0,
-	// )
 	const metaSize = 16 + 8 + 8 // session + timestamp + index
 
 	if len(sessionNumber) > 16 {
@@ -654,7 +697,7 @@ func createFabricBroadcastEnvelope(index int, targetEnvSize int, sessionNumber [
 		return nil, fmt.Errorf("targetEnvSize too small")
 	}
 
-	build := func(payloadSize int) (*cb.Envelope, error) {
+	build := func(payloadSize int) (*cb.Envelope, []byte, int, error) {
 		payload := make([]byte, payloadSize)
 
 		copy(payload[:16], sessionNumber)
@@ -663,7 +706,7 @@ func createFabricBroadcastEnvelope(index int, targetEnvSize int, sessionNumber [
 		binary.LittleEndian.PutUint64(payload[16:24], uint64(timestamp))
 		binary.LittleEndian.PutUint64(payload[24:32], uint64(index))
 
-		return protoutil.CreateSignedEnvelope(
+		env, err := protoutil.CreateSignedEnvelope(
 			cb.HeaderType_ENDORSER_TRANSACTION,
 			channelID,
 			signer,
@@ -671,45 +714,97 @@ func createFabricBroadcastEnvelope(index int, targetEnvSize int, sessionNumber [
 			0,
 			0,
 		)
-	}
-
-	payloadSize := metaSize
-
-	for i := 0; i < 20; i++ {
-		env, err := build(payloadSize)
 		if err != nil {
-			return nil, err
+			return nil, nil, 0, err
 		}
 
-		actualSize := len(protoutil.MarshalOrPanic(env))
-		fmt.Printf("actual tx size is: %v\n", actualSize)
-		delta := targetEnvSize - actualSize
-
-		if delta == 0 {
-			return env, nil
-		}
-
-		payloadSize += delta
-		if payloadSize < metaSize {
-			return nil, fmt.Errorf(
-				"targetEnvSize=%d too small; current minimum envelope size=%d",
-				targetEnvSize,
-				actualSize,
-			)
-		}
+		return env, payload, len(protoutil.MarshalOrPanic(env)), nil
 	}
 
-	env, err := build(payloadSize)
+	minEnv, originalPayload, minEnvSize, err := build(metaSize)
 	if err != nil {
 		return nil, err
 	}
 
-	return nil, fmt.Errorf(
-		"could not reach exact size: target=%d actual=%d payloadSize=%d",
-		targetEnvSize,
-		len(protoutil.MarshalOrPanic(env)),
-		payloadSize,
-	)
+	if minEnvSize > targetEnvSize {
+		return nil, fmt.Errorf("cannot create envelope of size %d; minimum envelope size is %d", targetEnvSize, minEnvSize)
+	}
+
+	if minEnvSize == targetEnvSize {
+		return minEnv, nil
+	}
+	logger.Debugf("initial env size with 32 bytes for original payload %x is: %d\n", sha256.Sum256(originalPayload), minEnvSize)
+
+	overhead := minEnvSize - metaSize
+	payloadSize := targetEnvSize - overhead
+
+	if payloadSize < metaSize {
+		payloadSize = metaSize
+	}
+
+	for attempts := 0; attempts < 20; attempts++ {
+		env, _, actualSize, err := build(payloadSize)
+		if err != nil {
+			return nil, err
+		}
+
+		logger.Debugf(
+			"attempt=%d payloadSize=%d targetEnvSize=%d actualEnvSize=%d originalPayloadHash=%x",
+			attempts,
+			payloadSize,
+			targetEnvSize,
+			actualSize,
+			sha256.Sum256(originalPayload),
+		)
+
+		if actualSize == targetEnvSize {
+			logger.Debugf("actual size == target size for original payload %x\n", sha256.Sum256(originalPayload))
+			return env, nil
+		}
+
+		diff := targetEnvSize - actualSize
+		payloadSize += diff
+		logger.Debugf("payload size for next attempt is: %v\n", payloadSize)
+
+		if payloadSize < metaSize {
+			return nil, fmt.Errorf(
+				"cannot create envelope of size %d; minimum envelope size is %d",
+				targetEnvSize,
+				minEnvSize,
+			)
+		}
+	}
+
+	return nil, fmt.Errorf("cannot create exact envelope size %d after retries; protobuf encoding may skip this size", targetEnvSize)
+	//payloadSize := metaSize
+	//
+	//env, err := build(payloadSize)
+	//if err != nil {
+	//	return nil, err
+	//}
+	//
+	//actualEnvSize := len(protoutil.MarshalOrPanic(env))
+	//logger.Infof("actual tx size for env %v is: %v\n", sha256.Sum256(protoutil.MarshalOrPanic(env)), actualEnvSize)
+	//
+	//if targetEnvSize < actualEnvSize {
+	//	return nil, fmt.Errorf("targetEnvSize=%d too small; current minimum envelope size=%d", targetEnvSize, actualEnvSize)
+	//}
+	//
+	//delta := targetEnvSize - actualEnvSize
+	//if delta == 0 {
+	//	return env, nil
+	//}
+	//
+	//actualEnvSize += delta
+	//logger.Infof("target tx size is: %v\n", actualEnvSize)
+	//
+	//// build the env with the right size
+	//env, err = build(actualEnvSize)
+	//if err != nil {
+	//	return nil, err
+	//}
+	//
+	//return nil, nil
 }
 
 func extractPayloadBytes(env *cb.Envelope) ([]byte, error) {
@@ -746,6 +841,7 @@ func extractPayloadBytes(env *cb.Envelope) ([]byte, error) {
 	return innerEnv.Payload, nil
 }
 
+// TODO: check
 func extractTimestampFromTx(data []byte) time.Time {
 	// if len(data) < 24 {
 	// 	return time.Unix(0, 0)
@@ -762,7 +858,7 @@ func extractTimestampFromTx(data []byte) time.Time {
 
 func reportLoadResults(transactions int, elapsed time.Duration, txSize int) {
 	avgTxSendingRate := float64(transactions) / elapsed.Seconds()
-	fmt.Printf("Load command finished, sent %d TXs in %v seconds, TX size %d, avg. tx sending rate: %.2f\n", transactions, elapsed, txSize, avgTxSendingRate)
+	logger.Infof("Load command finished, sent %d TXs in %v seconds, TX size %d, avg. tx sending rate: %.2f\n", transactions, elapsed, txSize, avgTxSendingRate)
 }
 
 func manageStatistics(receiveOutputDir string, statisticChan <-chan Statistics, stopChan <-chan bool, startTime float64, expectedTxs int, pullFrom int, timeIntervalToSampleStat time.Duration) {
