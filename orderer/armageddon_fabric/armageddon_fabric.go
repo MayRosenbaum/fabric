@@ -138,6 +138,7 @@ type BroadcastTxClient struct {
 	ordererEndpoints []string
 	streams          []*StreamInfo
 	stopChan         chan struct{}
+	totalTxsSent     uint64
 }
 
 func NewBroadcastTxClient(ordererEndpoints []string) *BroadcastTxClient {
@@ -145,6 +146,7 @@ func NewBroadcastTxClient(ordererEndpoints []string) *BroadcastTxClient {
 		ordererEndpoints: ordererEndpoints,
 		streams:          make([]*StreamInfo, len(ordererEndpoints)),
 		stopChan:         make(chan struct{}),
+		totalTxsSent:     0,
 	}
 }
 
@@ -194,6 +196,7 @@ func (c *BroadcastTxClient) SendTxToAllOrderers(envelope *cb.Envelope) {
 				streamInfo.TryReconnect()
 			} else {
 				atomic.AddUint64(&streamInfo.sentTxs, 1)
+				atomic.AddUint64(&c.totalTxsSent, 1)
 			}
 		}
 	}
@@ -468,7 +471,7 @@ func sendTxsToAllAvailableOrderers(ordererEndpoints []string, channelID string, 
 
 		broadcastClient.SendTxToAllOrderers(env)
 	}
-
+	logger.Infof("broadcast client send %d txs", int(broadcastClient.totalTxsSent)/len(ordererEndpoints))
 	rl.Stop()
 	return broadcastClient.Stop()
 }
