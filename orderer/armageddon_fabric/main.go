@@ -25,7 +25,8 @@ func parseServers(servers string) []string {
 	return result
 }
 
-func main() {
+func buildConfig(fs *flag.FlagSet, args []string) Config {
+	//fmt.Printf("buildConfig args: %#v\n", args)
 	var servers string
 	var channelID string
 	var transactions int
@@ -35,15 +36,19 @@ func main() {
 	var outputDir string
 	var pullFrom int
 
-	flag.StringVar(&servers, "servers", "127.0.0.1:7050", "Comma-separated list of orderer addresses")
-	flag.StringVar(&channelID, "channelID", "mychannel", "The channel ID to broadcast to and deliver from")
-	flag.IntVar(&transactions, "transactions", 1000, "The number of transactions to send")
-	flag.StringVar(&rate, "rate", "500", "The number of transactions per second to send; supports one or more space-separated values")
-	flag.IntVar(&txSize, "txSize", 512, "The transaction payload size in bytes")
-	flag.IntVar(&expectedTxs, "expectedTxs", -1, "The expected number of transactions to receive before stopping")
-	flag.StringVar(&outputDir, "output", ".", "The output directory in which to place statistics.csv")
-	flag.IntVar(&pullFrom, "pullFrom", 1, "The 1-based orderer index to pull blocks from")
-	flag.Parse()
+	fs.StringVar(&servers, "servers", "127.0.0.1:7050", "Comma-separated list of orderer addresses")
+	fs.StringVar(&channelID, "channelID", "mychannel", "The channel ID to broadcast to and deliver from")
+	fs.IntVar(&transactions, "transactions", 1000, "The number of transactions to send")
+	fs.StringVar(&rate, "rate", "500", "The number of transactions per second to send; supports one or more space-separated values")
+	fs.IntVar(&txSize, "txSize", 512, "The transaction payload size in bytes")
+	fs.IntVar(&expectedTxs, "expectedTxs", -1, "The expected number of transactions to receive before stopping")
+	fs.StringVar(&outputDir, "output", ".", "The output directory in which to place statistics.csv")
+	fs.IntVar(&pullFrom, "pullFrom", 1, "The 1-based orderer index to pull blocks from")
+
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	serverList := parseServers(servers)
 	if len(serverList) == 0 {
@@ -54,6 +59,10 @@ func main() {
 	if expectedTxs < 0 {
 		expectedTxs = transactions
 	}
+
+	//fmt.Printf("parsed flags: channelID=%s transactions=%d rate=%s txSize=%d output=%s\n",
+	//	channelID, transactions, rate, txSize, outputDir,
+	//)
 
 	//signer, err := loadLocalSigner()
 	signer := &fake.Signer{}
@@ -74,32 +83,70 @@ func main() {
 		Signer:       signer,
 	}
 
-	loadErrCh := make(chan error, 1)
-	receiveErrCh := make(chan error, 1)
-
-	go func() {
-		loadErrCh <- Load(cfg)
-	}()
-
-	go func() {
-		receiveErrCh <- Receive(cfg)
-	}()
-
-	// First, wait for Load.
-	if err := <-loadErrCh; err != nil {
-		fmt.Fprintln(os.Stderr, "Load failed:", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("Load finished successfully, waiting for receiver...")
-
-	// Then wait for Receive to finish expectedTxs.
-	if err := <-receiveErrCh; err != nil {
-		fmt.Fprintln(os.Stderr, "Receive failed:", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Completed successfully. Statistics written to %s/statistics.csv\n", outputDir)
+	return cfg
 }
 
-// Made with Bob
+//	loadErrCh := make(chan error, 1)
+//	receiveErrCh := make(chan error, 1)
+//
+//	go func() {
+//		loadErrCh <- Load(cfg)
+//	}()
+//
+//	go func() {
+//		receiveErrCh <- Receive(cfg)
+//	}()
+//
+//	// First, wait for Load.
+//	if err := <-loadErrCh; err != nil {
+//		fmt.Fprintln(os.Stderr, "Load failed:", err)
+//		os.Exit(1)
+//	}
+//
+//	fmt.Println("Load finished successfully, waiting for receiver...")
+//
+//	// Then wait for Receive to finish expectedTxs.
+//	if err := <-receiveErrCh; err != nil {
+//		fmt.Fprintln(os.Stderr, "Receive failed:", err)
+//		os.Exit(1)
+//	}
+//
+//	fmt.Printf("Completed successfully. Statistics written to %s/statistics.csv\n", outputDir)
+//}
+//
+//// Made with Bob
+
+func main() {
+	if len(os.Args) < 2 {
+		os.Exit(1)
+	}
+
+	switch os.Args[1] {
+	case "load":
+		//fmt.Printf("ARGS: %#v\n", os.Args)
+		fs := flag.NewFlagSet("load", flag.ExitOnError)
+		cfg := buildConfig(fs, os.Args[2:])
+
+		if err := Load(cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "Load failed:", err)
+			os.Exit(1)
+		}
+
+		fmt.Println("Load finished successfully")
+
+	case "receive":
+		//fmt.Printf("ARGS: %#v\n", os.Args)
+		fs := flag.NewFlagSet("receive", flag.ExitOnError)
+		cfg := buildConfig(fs, os.Args[2:])
+
+		if err := Receive(cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "Receive failed:", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Receive finished successfully. Statistics written to %s/statistics.csv\n", cfg.OutputDir)
+
+	default:
+		os.Exit(1)
+	}
+}

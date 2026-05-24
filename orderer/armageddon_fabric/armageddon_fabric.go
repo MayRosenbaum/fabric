@@ -397,6 +397,12 @@ type BlockWithTime struct {
 }
 
 func Load(cfg Config) error {
+	//fmt.Printf("LOAD config: channelID=%s transactions=%d rate=%s txSize=%d\n",
+	//	cfg.ChannelID,
+	//	cfg.Transactions,
+	//	cfg.Rate,
+	//	cfg.TxSize,
+	//)
 	rates := strings.Fields(cfg.Rate)
 	if len(cfg.Servers) == 0 {
 		return fmt.Errorf("no orderer servers were provided")
