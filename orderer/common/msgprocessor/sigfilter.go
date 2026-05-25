@@ -99,16 +99,22 @@ func (sf *SigFilter) Apply(message *cb.Envelope) error {
 	// simulate the verification of a signature
 	if len(message.Payload) <= 1000 {
 		// call service300
+		//logger.Info("Emulation: verify tx with size 300")
+		//for i := 0; i < 10; i++ {
 		isValid := txservice.TxService300.VerifyTransaction()
 		if !isValid {
 			logger.Warn("emulation: verify non valid tx")
 		}
+		//}
 	} else {
 		// call service3500
+		//logger.Info("Emulation: verify tx with size 3500")
+		//for i := 0; i < 10; i++ {
 		isValid := txservice.TxService3500.VerifyTransaction()
 		if !isValid {
 			logger.Warn("emulation: verify non valid tx")
 		}
+		//}
 	}
 	return nil
 }

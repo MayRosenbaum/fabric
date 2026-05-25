@@ -69,7 +69,7 @@ var (
 // Main is the entry point of orderer process
 func Main() {
 	var err error
-	numOfTxs := 2000000
+	numOfTxs := 1000
 	txservice.TxService300, err = txservice.NewSignedTransactionService(numOfTxs, 300)
 	if err != nil {
 		logger.Panicf("Could not create signed tx service for size 300, err: %v", err)
