@@ -10,6 +10,7 @@ import (
 	cb "github.com/hyperledger/fabric-protos-go-apiv2/common"
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/policies"
+	"github.com/hyperledger/fabric/orderer/txservice"
 )
 
 // SigFilterSupport provides the resources required for the signature filter
@@ -43,12 +44,31 @@ func NewSigFilter(normalPolicyName, maintenancePolicyName string, support SigFil
 
 //// Apply applies the policy given, resulting in Reject or Forward, never Accept
 //func (sf *SigFilter) Apply(message *cb.Envelope) error {
+//	// build an envelope that pass the verification
+//	//privKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+//	//sID := &mspprotos.SerializedIdentity{
+//	//	Mspid:   "SampleOrg",
+//	//	IdBytes: []byte("FAKE_CERT_BYTES"),
+//	//}
+//	//creatorBytes, _ := proto.Marshal(sID)
+//	//payload := make([]byte, 300)
+//	//for i := range payload {
+//	//	payload[i] = byte(i % 255)
+//	//}
+//	//hash := sha256.Sum256(payload)
+//	//r, s, _ := ecdsa.Sign(rand.Reader, privKey, hash[:])
+//	//signature := append(r.Bytes(), s.Bytes()...)
+//	//env := &cb.Envelope{
+//	//	Payload:   payload,
+//	//	Signature: signature,
+//	//}
+//
 //	ordererConf, ok := sf.support.OrdererConfig()
 //	if !ok {
 //		logger.Panic("Programming error: orderer config not found")
 //	}
 //
-//	signedData, err := protoutil.EnvelopeAsSignedData(message)
+//	signedData, err := protoutil.EnvelopeAsSignedData(env)
 //	if err != nil {
 //		return fmt.Errorf("could not convert message to signedData: %s", err)
 //	}
@@ -76,5 +96,19 @@ func NewSigFilter(normalPolicyName, maintenancePolicyName string, support SigFil
 
 // Apply resulting in Accept every message, used for fabric performance
 func (sf *SigFilter) Apply(message *cb.Envelope) error {
+	// simulate the verification of a signature
+	if len(message.Payload) <= 1000 {
+		// call service300
+		isValid := txservice.TxService300.VerifyTransaction()
+		if !isValid {
+			logger.Warn("emulation: verify non valid tx")
+		}
+	} else {
+		// call service3500
+		isValid := txservice.TxService3500.VerifyTransaction()
+		if !isValid {
+			logger.Warn("emulation: verify non valid tx")
+		}
+	}
 	return nil
 }

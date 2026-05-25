@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/hyperledger/fabric/orderer/txservice"
 	"net"
 	"net/http"
 	_ "net/http/pprof" // This is essentially the main package for the orderer
@@ -67,6 +68,17 @@ var (
 
 // Main is the entry point of orderer process
 func Main() {
+	var err error
+	numOfTxs := 2000000
+	txservice.TxService300, err = txservice.NewSignedTransactionService(numOfTxs, 300)
+	if err != nil {
+		logger.Panicf("Could not create signed tx service for size 300, err: %v", err)
+	}
+	txservice.TxService3500, err = txservice.NewSignedTransactionService(numOfTxs, 3500)
+	if err != nil {
+		logger.Panicf("Could not create signed tx service for size 3500, err: %v", err)
+	}
+
 	fullCmd := kingpin.MustParse(app.Parse(os.Args[1:]))
 
 	// "version" command
