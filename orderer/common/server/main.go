@@ -68,6 +68,7 @@ var (
 
 // Main is the entry point of orderer process
 func Main() {
+	logger.Infof("Creating a signed transaction service for tx verification emulation")
 	var err error
 	numOfTxs := 1000
 	txservice.TxService300, err = txservice.NewSignedTransactionService(numOfTxs, 300)
